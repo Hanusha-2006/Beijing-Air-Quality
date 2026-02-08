@@ -1,0 +1,647 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import RobustScaler, LabelEncoder
+from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, AdaBoostRegressor
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.svm import SVR
+from sklearn.neighbors import KNeighborsRegressor
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import warnings
+warnings.filterwarnings('ignore')
+
+print("=" * 80)
+print("BEIJING MULTI-SITE AIR QUALITY - UNIFIED MODEL APPROACH")
+print("ONE MODEL FOR ALL 12 STATIONS")
+print("=" * 80)
+
+# ==================== LOAD ALL STATION DATA ====================
+stations = {
+    'Aotizhongxin': "C:\\Users\\hanus\\Downloads\\beijing+multi+site+air+quality+data\\PRSA2017_Data_20130301-20170228\\PRSA_Data_20130301-20170228\\PRSA_Data_Aotizhongxin_20130301-20170228.csv",
+    'Changping': "C:\\Users\\hanus\\Downloads\\beijing+multi+site+air+quality+data\\PRSA2017_Data_20130301-20170228\\PRSA_Data_20130301-20170228\\PRSA_Data_Changping_20130301-20170228.csv",
+    'Dingling': "C:\\Users\\hanus\\Downloads\\beijing+multi+site+air+quality+data\\PRSA2017_Data_20130301-20170228\\PRSA_Data_20130301-20170228\\PRSA_Data_Dingling_20130301-20170228.csv",
+    'Dongsi': "C:\\Users\\hanus\\Downloads\\beijing+multi+site+air+quality+data\\PRSA2017_Data_20130301-20170228\\PRSA_Data_20130301-20170228\\PRSA_Data_Dongsi_20130301-20170228.csv",
+    'Guanyuan': "C:\\Users\\hanus\\Downloads\\beijing+multi+site+air+quality+data\\PRSA2017_Data_20130301-20170228\\PRSA_Data_20130301-20170228\\PRSA_Data_Guanyuan_20130301-20170228.csv",
+    'Gucheng': "C:\\Users\\hanus\\Downloads\\beijing+multi+site+air+quality+data\\PRSA2017_Data_20130301-20170228\\PRSA_Data_20130301-20170228\\PRSA_Data_Gucheng_20130301-20170228.csv",
+    'Huairou': "C:\\Users\\hanus\\Downloads\\beijing+multi+site+air+quality+data\\PRSA2017_Data_20130301-20170228\\PRSA_Data_20130301-20170228\\PRSA_Data_Huairou_20130301-20170228.csv",
+    'Nongzhanguan': "C:\\Users\\hanus\\Downloads\\beijing+multi+site+air+quality+data\\PRSA2017_Data_20130301-20170228\\PRSA_Data_20130301-20170228\\PRSA_Data_Nongzhanguan_20130301-20170228.csv",
+    'Shunyi': "C:\\Users\\hanus\\Downloads\\beijing+multi+site+air+quality+data\\PRSA2017_Data_20130301-20170228\\PRSA_Data_20130301-20170228\\PRSA_Data_Shunyi_20130301-20170228.csv",
+    'Tiantan': "C:\\Users\\hanus\\Downloads\\beijing+multi+site+air+quality+data\\PRSA2017_Data_20130301-20170228\\PRSA_Data_20130301-20170228\\PRSA_Data_Tiantan_20130301-20170228.csv",
+    'Wanliu': "C:\\Users\\hanus\\Downloads\\beijing+multi+site+air+quality+data\\PRSA2017_Data_20130301-20170228\\PRSA_Data_20130301-20170228\\PRSA_Data_Wanliu_20130301-20170228.csv",
+    'Wanshouxigong': "C:\\Users\\hanus\\Downloads\\beijing+multi+site+air+quality+data\\PRSA2017_Data_20130301-20170228\\PRSA_Data_20130301-20170228\\PRSA_Data_Wanshouxigong_20130301-20170228.csv"
+}
+
+print(f"\n📍 Loading data from {len(stations)} monitoring stations...")
+
+all_station_dfs = []
+for station_name, path in stations.items():
+    try:
+        df = pd.read_csv(path)
+        df['station'] = station_name
+        all_station_dfs.append(df)
+        print(f"   ✓ {station_name}: {df.shape[0]} rows")
+    except Exception as e:
+        print(f"   ✗ {station_name}: Failed - {e}")
+
+# Combine all stations into one dataset
+combined_df = pd.concat(all_station_dfs, ignore_index=True)
+print(f"\n✓ Combined dataset: {len(combined_df):,} rows from {combined_df['station'].nunique()} stations")
+
+# ==================== PREPROCESSING ====================
+print("\n" + "=" * 80)
+print("STEP 1: UNIFIED PREPROCESSING")
+print("=" * 80)
+
+# Create datetime
+combined_df['datetime'] = pd.to_datetime(combined_df[['year', 'month', 'day', 'hour']])
+
+# Encode station as categorical
+le = LabelEncoder()
+combined_df['station_encoded'] = le.fit_transform(combined_df['station'])
+
+# Handle wind direction
+if 'wd' in combined_df.columns:
+    combined_df['wd'] = combined_df['wd'].fillna('Unknown')
+    wd_encoder = LabelEncoder()
+    combined_df['wd_encoded'] = wd_encoder.fit_transform(combined_df['wd'])
+
+numeric_columns = ['PM2.5', 'PM10', 'SO2', 'NO2', 'CO', 'O3', 'TEMP', 'PRES', 'DEWP', 'RAIN', 'WSPM']
+available_numeric = [col for col in numeric_columns if col in combined_df.columns]
+
+print(f"\n🔧 Normalizing {len(available_numeric)} features with RobustScaler...")
+scaler = RobustScaler()
+combined_df[available_numeric] = scaler.fit_transform(combined_df[available_numeric])
+
+print(f"🔧 Filling missing values with interpolation...")
+combined_df = combined_df.sort_values(['station', 'datetime']).reset_index(drop=True)
+
+for col in available_numeric:
+    combined_df[col] = combined_df.groupby('station')[col].transform(
+        lambda x: x.interpolate(method='linear', limit_direction='both').fillna(method='ffill').fillna(method='bfill')
+    )
+
+# ==================== FEATURE ENGINEERING ====================
+print("\n" + "=" * 80)
+print("STEP 2: FEATURE ENGINEERING")
+print("=" * 80)
+
+print("1️⃣ Temporal Features...")
+combined_df['hour'] = combined_df['datetime'].dt.hour
+combined_df['day'] = combined_df['datetime'].dt.day
+combined_df['month'] = combined_df['datetime'].dt.month
+combined_df['dayofweek'] = combined_df['datetime'].dt.dayofweek
+combined_df['dayofyear'] = combined_df['datetime'].dt.dayofyear
+combined_df['is_weekend'] = (combined_df['dayofweek'] >= 5).astype(int)
+
+# Cyclical encoding
+combined_df['hour_sin'] = np.sin(2 * np.pi * combined_df['hour'] / 24)
+combined_df['hour_cos'] = np.cos(2 * np.pi * combined_df['hour'] / 24)
+combined_df['month_sin'] = np.sin(2 * np.pi * combined_df['month'] / 12)
+combined_df['month_cos'] = np.cos(2 * np.pi * combined_df['month'] / 12)
+
+print("2️⃣ Lag Features (grouped by station)...")
+lag_periods = [1, 3, 6, 12, 24]
+for lag in lag_periods:
+    combined_df[f'PM2.5_lag_{lag}'] = combined_df.groupby('station')['PM2.5'].shift(lag)
+    combined_df[f'TEMP_lag_{lag}'] = combined_df.groupby('station')['TEMP'].shift(lag)
+
+print("3️⃣ Rolling Features (grouped by station)...")
+rolling_windows = [3, 6, 12, 24]
+for window in rolling_windows:
+    combined_df[f'PM2.5_rolling_mean_{window}'] = combined_df.groupby('station')['PM2.5'].transform(
+        lambda x: x.rolling(window=window, min_periods=1).mean()
+    )
+    combined_df[f'PM2.5_rolling_std_{window}'] = combined_df.groupby('station')['PM2.5'].transform(
+        lambda x: x.rolling(window=window, min_periods=1).std()
+    )
+
+print("4️⃣ Interaction Features...")
+combined_df['TEMP_PRES_interaction'] = combined_df['TEMP'] * combined_df['PRES']
+combined_df['TEMP_DEWP_interaction'] = combined_df['TEMP'] * combined_df['DEWP']
+combined_df['NO2_SO2_interaction'] = combined_df['NO2'] * combined_df['SO2']
+
+# Drop NaN rows
+initial_rows = len(combined_df)
+combined_df = combined_df.dropna()
+print(f"\n5️⃣ Cleaned: Dropped {initial_rows - len(combined_df)} rows with NaN")
+print(f"   Final dataset: {len(combined_df):,} rows")
+
+# ==================== PREPARE DATA FOR MODELING ====================
+print("\n" + "=" * 80)
+print("STEP 3: PREPARING UNIFIED MODEL DATA")
+print("=" * 80)
+
+feature_cols = [col for col in combined_df.columns if col not in 
+               ['datetime', 'station', 'year', 'day', 'PM2.5', 'wd', 'No']]
+
+X = combined_df[feature_cols]
+y = combined_df['PM2.5']
+
+print(f"   Features: {len(feature_cols)}")
+print(f"   Samples: {len(X):,}")
+print(f"   Stations: {combined_df['station'].nunique()}")
+
+# Train-test split (80-20)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, shuffle=False
+)
+
+print(f"   Training: {len(X_train):,} samples ({len(X_train)/len(X)*100:.1f}%)")
+print(f"   Testing: {len(X_test):,} samples ({len(X_test)/len(X)*100:.1f}%)")
+
+# ==================== MODEL TRAINING ====================
+print("\n" + "=" * 80)
+print("STEP 4: TRAINING 10 REGRESSION MODELS")
+print("=" * 80)
+
+models = {
+    'Linear Regression': LinearRegression(),
+    'Ridge Regression': Ridge(alpha=1.0),
+    'Lasso Regression': Lasso(alpha=0.01, max_iter=5000),
+    'ElasticNet': ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=5000),
+    'Decision Tree': DecisionTreeRegressor(max_depth=10, random_state=42),
+    'Random Forest': RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1),
+    'Gradient Boosting': GradientBoostingRegressor(n_estimators=100, max_depth=5, random_state=42),
+    'XGBoost': XGBRegressor(n_estimators=100, max_depth=5, random_state=42, n_jobs=-1, verbosity=0),
+    'AdaBoost': AdaBoostRegressor(n_estimators=50, random_state=42),
+    'K-Nearest Neighbors': KNeighborsRegressor(n_neighbors=5)
+}
+
+results = []
+predictions = {}
+trained_models = {}
+
+print("\n🔄 Training models on unified dataset...")
+print("-" * 80)
+
+for name, model in models.items():
+    print(f"   Training {name}...", end=" ")
+    
+    model.fit(X_train, y_train)
+    
+    y_pred_train = model.predict(X_train)
+    y_pred_test = model.predict(X_test)
+    
+    train_mse = mean_squared_error(y_train, y_pred_train)
+    test_mse = mean_squared_error(y_test, y_pred_test)
+    train_rmse = np.sqrt(train_mse)
+    test_rmse = np.sqrt(test_mse)
+    train_mae = mean_absolute_error(y_train, y_pred_train)
+    test_mae = mean_absolute_error(y_test, y_pred_test)
+    train_r2 = r2_score(y_train, y_pred_train)
+    test_r2 = r2_score(y_test, y_pred_test)
+    
+    cv_scores = cross_val_score(model, X_train, y_train, cv=5, 
+                                scoring='neg_mean_squared_error', n_jobs=-1)
+    cv_rmse = np.sqrt(-cv_scores.mean())
+    
+    results.append({
+        'Algorithm': name,
+        'Train_RMSE': train_rmse,
+        'Test_RMSE': test_rmse,
+        'Train_MAE': train_mae,
+        'Test_MAE': test_mae,
+        'Train_R2': train_r2,
+        'Test_R2': test_r2,
+        'CV_RMSE': cv_rmse,
+        'Overfit': train_rmse - test_rmse
+    })
+    
+    predictions[name] = y_pred_test
+    trained_models[name] = model
+    
+    print(f"✓ RMSE: {test_rmse:.4f}, R²: {test_r2:.4f}")
+
+results_df = pd.DataFrame(results)
+results_df = results_df.sort_values('Test_RMSE')
+
+# ==================== RESULTS ====================
+print("\n" + "=" * 80)
+print("RESULTS: UNIFIED MODEL PERFORMANCE")
+print("=" * 80)
+
+print("\n📊 Model Performance Ranking:")
+print("-" * 80)
+print(results_df.to_string(index=False))
+
+best_model_name = results_df.iloc[0]['Algorithm']
+best_rmse = results_df.iloc[0]['Test_RMSE']
+best_r2 = results_df.iloc[0]['Test_R2']
+
+print(f"\n🏆 BEST MODEL: {best_model_name}")
+print(f"   Test RMSE: {best_rmse:.4f}")
+print(f"   Test R²: {best_r2:.4f}")
+print(f"   Test MAE: {results_df.iloc[0]['Test_MAE']:.4f}")
+print(f"   CV RMSE: {results_df.iloc[0]['CV_RMSE']:.4f}")
+print(f"   Overfitting: {results_df.iloc[0]['Overfit']:.4f}")
+
+# ==================== HYPERPARAMETER OPTIMIZATION ====================
+print("\n" + "=" * 80)
+print("STEP 5: HYPERPARAMETER OPTIMIZATION (Best Model)")
+print("=" * 80)
+
+print(f"\n🔧 Optimizing {best_model_name}...")
+
+if best_model_name == 'Random Forest':
+    param_grid = {
+        'n_estimators': [100, 150, 200],
+        'max_depth': [10, 15, 20],
+        'min_samples_split': [2, 5, 10]
+    }
+    base_model = RandomForestRegressor(random_state=42, n_jobs=-1)
+    
+elif best_model_name == 'XGBoost':
+    param_grid = {
+        'n_estimators': [100, 150, 200],
+        'max_depth': [5, 7, 10],
+        'learning_rate': [0.01, 0.05, 0.1]
+    }
+    base_model = XGBRegressor(random_state=42, n_jobs=-1, verbosity=0)
+    
+elif best_model_name == 'Gradient Boosting':
+    param_grid = {
+        'n_estimators': [100, 150, 200],
+        'max_depth': [5, 7, 10],
+        'learning_rate': [0.01, 0.05, 0.1]
+    }
+    base_model = GradientBoostingRegressor(random_state=42)
+    
+elif best_model_name == 'Ridge Regression':
+    param_grid = {'alpha': [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]}
+    base_model = Ridge()
+    
+elif best_model_name == 'Lasso Regression':
+    param_grid = {'alpha': [0.001, 0.01, 0.1, 1.0, 10.0]}
+    base_model = Lasso(max_iter=5000)
+    
+elif best_model_name == 'Decision Tree':
+    param_grid = {
+        'max_depth': [10, 15, 20, 25],
+        'min_samples_split': [2, 5, 10]
+    }
+    base_model = DecisionTreeRegressor(random_state=42)
+    
+else:
+    param_grid = {}
+    base_model = trained_models[best_model_name]
+
+if param_grid:
+    grid_search = GridSearchCV(base_model, param_grid, cv=5, 
+                               scoring='neg_mean_squared_error', n_jobs=-1)
+    grid_search.fit(X_train, y_train)
+    
+    best_model = grid_search.best_estimator_
+    y_pred_opt = best_model.predict(X_test)
+    
+    opt_rmse = np.sqrt(mean_squared_error(y_test, y_pred_opt))
+    opt_r2 = r2_score(y_test, y_pred_opt)
+    opt_mae = mean_absolute_error(y_test, y_pred_opt)
+    
+    improvement = best_rmse - opt_rmse
+    
+    print(f"   Best params: {grid_search.best_params_}")
+    print(f"   Optimized RMSE: {opt_rmse:.4f} (improvement: {improvement:.4f})")
+    print(f"   Optimized R²: {opt_r2:.4f}")
+    print(f"   Optimized MAE: {opt_mae:.4f}")
+    
+    # Use optimized model
+    best_model_obj = best_model
+    best_predictions = y_pred_opt
+    final_rmse = opt_rmse
+    final_r2 = opt_r2
+    final_mae = opt_mae
+else:
+    best_model_obj = trained_models[best_model_name]
+    best_predictions = predictions[best_model_name]
+    final_rmse = best_rmse
+    final_r2 = best_r2
+    final_mae = results_df.iloc[0]['Test_MAE']
+
+# ==================== PER-STATION ANALYSIS ====================
+print("\n" + "=" * 80)
+print("STEP 6: PER-STATION PERFORMANCE ANALYSIS")
+print("=" * 80)
+
+# Get station info for test set
+test_indices = X_test.index
+test_stations = combined_df.loc[test_indices, 'station']
+
+station_performance = []
+for station in combined_df['station'].unique():
+    station_mask = test_stations == station
+    if station_mask.sum() > 0:
+        y_true_station = y_test[station_mask]
+        y_pred_station = best_predictions[station_mask]
+        
+        station_rmse = np.sqrt(mean_squared_error(y_true_station, y_pred_station))
+        station_r2 = r2_score(y_true_station, y_pred_station)
+        station_mae = mean_absolute_error(y_true_station, y_pred_station)
+        
+        station_performance.append({
+            'Station': station,
+            'RMSE': station_rmse,
+            'R2': station_r2,
+            'MAE': station_mae,
+            'Samples': station_mask.sum()
+        })
+
+station_perf_df = pd.DataFrame(station_performance).sort_values('RMSE')
+
+print("\n📍 Performance by Station:")
+print("-" * 80)
+print(station_perf_df.to_string(index=False))
+
+print(f"\n📊 Station Statistics:")
+print(f"   Best Station (lowest RMSE): {station_perf_df.iloc[0]['Station']} (RMSE: {station_perf_df.iloc[0]['RMSE']:.4f})")
+print(f"   Worst Station (highest RMSE): {station_perf_df.iloc[-1]['Station']} (RMSE: {station_perf_df.iloc[-1]['RMSE']:.4f})")
+print(f"   Average RMSE across stations: {station_perf_df['RMSE'].mean():.4f}")
+print(f"   Average R² across stations: {station_perf_df['R2'].mean():.4f}")
+
+# ==================== FEATURE IMPORTANCE ====================
+if best_model_name in ['Random Forest', 'Gradient Boosting', 'XGBoost', 'Decision Tree']:
+    print("\n" + "=" * 80)
+    print("STEP 7: FEATURE IMPORTANCE ANALYSIS")
+    print("=" * 80)
+    
+    feature_importance = pd.DataFrame({
+        'Feature': feature_cols,
+        'Importance': best_model_obj.feature_importances_
+    }).sort_values('Importance', ascending=False).head(20)
+    
+    print("\n🎯 Top 20 Important Features:")
+    print("-" * 80)
+    for i, row in feature_importance.iterrows():
+        print(f"   {row['Feature']}: {row['Importance']:.4f}")
+
+# ==================== VISUALIZATIONS ====================
+print("\n" + "=" * 80)
+print("GENERATING VISUALIZATIONS")
+print("=" * 80)
+
+# Figure 1: Model Comparison
+fig1, axes = plt.subplots(2, 2, figsize=(16, 12))
+fig1.suptitle('Unified Model Performance - All Stations Combined', fontsize=16, fontweight='bold')
+
+# Test RMSE
+ax1 = axes[0, 0]
+colors = ['#2ecc71' if i == 0 else '#3498db' for i in range(len(results_df))]
+bars = ax1.barh(results_df['Algorithm'], results_df['Test_RMSE'], color=colors, alpha=0.7)
+ax1.set_xlabel('Test RMSE', fontsize=11, fontweight='bold')
+ax1.set_title('Test RMSE Comparison', fontweight='bold', fontsize=12)
+ax1.invert_yaxis()
+ax1.grid(True, alpha=0.3, axis='x')
+for bar in bars:
+    width = bar.get_width()
+    ax1.text(width, bar.get_y() + bar.get_height()/2, f'{width:.4f}',
+            ha='left', va='center', fontsize=9, fontweight='bold')
+
+# Test R²
+ax2 = axes[0, 1]
+colors = ['#2ecc71' if i == 0 else '#e74c3c' for i in range(len(results_df))]
+bars = ax2.barh(results_df['Algorithm'], results_df['Test_R2'], color=colors, alpha=0.7)
+ax2.set_xlabel('Test R² Score', fontsize=11, fontweight='bold')
+ax2.set_title('Test R² Comparison', fontweight='bold', fontsize=12)
+ax2.invert_yaxis()
+ax2.set_xlim([0, 1])
+ax2.grid(True, alpha=0.3, axis='x')
+for bar in bars:
+    width = bar.get_width()
+    ax2.text(width + 0.02, bar.get_y() + bar.get_height()/2, f'{width:.3f}',
+            ha='left', va='center', fontsize=9, fontweight='bold')
+
+# Train vs Test RMSE
+ax3 = axes[1, 0]
+x = np.arange(len(results_df))
+width = 0.35
+bars1 = ax3.bar(x - width/2, results_df['Train_RMSE'], width, label='Train RMSE', 
+               color='#3498db', alpha=0.7)
+bars2 = ax3.bar(x + width/2, results_df['Test_RMSE'], width, label='Test RMSE', 
+               color='#e74c3c', alpha=0.7)
+ax3.set_xlabel('Algorithm', fontsize=11, fontweight='bold')
+ax3.set_ylabel('RMSE', fontsize=11, fontweight='bold')
+ax3.set_title('Train vs Test RMSE (Overfitting Check)', fontweight='bold', fontsize=12)
+ax3.set_xticks(x)
+ax3.set_xticklabels(results_df['Algorithm'], rotation=45, ha='right', fontsize=9)
+ax3.legend(fontsize=10)
+ax3.grid(True, alpha=0.3, axis='y')
+
+# CV RMSE
+ax4 = axes[1, 1]
+colors = ['#2ecc71' if i == 0 else '#9b59b6' for i in range(len(results_df))]
+bars = ax4.barh(results_df['Algorithm'], results_df['CV_RMSE'], color=colors, alpha=0.7)
+ax4.set_xlabel('CV RMSE (5-Fold)', fontsize=11, fontweight='bold')
+ax4.set_title('Cross-Validation RMSE', fontweight='bold', fontsize=12)
+ax4.invert_yaxis()
+ax4.grid(True, alpha=0.3, axis='x')
+for bar in bars:
+    width = bar.get_width()
+    ax4.text(width, bar.get_y() + bar.get_height()/2, f'{width:.4f}',
+            ha='left', va='center', fontsize=9, fontweight='bold')
+
+plt.tight_layout()
+plt.savefig('unified_model_comparison.png', dpi=300, bbox_inches='tight')
+print("✓ Saved: unified_model_comparison.png")
+
+# Figure 2: Predictions vs Actual
+fig2, ax = plt.subplots(figsize=(10, 8))
+sample_size = min(5000, len(y_test))
+indices = np.random.choice(len(y_test), sample_size, replace=False)
+
+ax.scatter(y_test.iloc[indices], best_predictions[indices], alpha=0.3, s=10, color='#3498db')
+min_val = min(y_test.min(), best_predictions.min())
+max_val = max(y_test.max(), best_predictions.max())
+ax.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Perfect Prediction')
+
+ax.set_xlabel('Actual PM2.5', fontsize=12, fontweight='bold')
+ax.set_ylabel('Predicted PM2.5', fontsize=12, fontweight='bold')
+ax.set_title(f'Predictions vs Actual - {best_model_name}\nRMSE: {final_rmse:.4f}, R²: {final_r2:.4f}', 
+            fontweight='bold', fontsize=14)
+ax.legend(fontsize=11)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('unified_predictions_vs_actual.png', dpi=300, bbox_inches='tight')
+print("✓ Saved: unified_predictions_vs_actual.png")
+
+# Figure 3: Station Performance
+fig3, axes = plt.subplots(1, 2, figsize=(16, 6))
+fig3.suptitle(f'Per-Station Performance - {best_model_name}', fontsize=16, fontweight='bold')
+
+ax1 = axes[0]
+colors = plt.cm.viridis(np.linspace(0.3, 0.9, len(station_perf_df)))
+bars = ax1.barh(station_perf_df['Station'], station_perf_df['RMSE'], color=colors, alpha=0.8)
+ax1.set_xlabel('RMSE', fontsize=11, fontweight='bold')
+ax1.set_title('RMSE by Station', fontweight='bold', fontsize=12)
+ax1.invert_yaxis()
+ax1.grid(True, alpha=0.3, axis='x')
+for bar in bars:
+    width = bar.get_width()
+    ax1.text(width, bar.get_y() + bar.get_height()/2, f'{width:.4f}',
+            ha='left', va='center', fontsize=9)
+
+ax2 = axes[1]
+colors = plt.cm.plasma(np.linspace(0.3, 0.9, len(station_perf_df)))
+bars = ax2.barh(station_perf_df['Station'], station_perf_df['R2'], color=colors, alpha=0.8)
+ax2.set_xlabel('R² Score', fontsize=11, fontweight='bold')
+ax2.set_title('R² Score by Station', fontweight='bold', fontsize=12)
+ax2.invert_yaxis()
+ax2.set_xlim([0, 1])
+ax2.grid(True, alpha=0.3, axis='x')
+for bar in bars:
+    width = bar.get_width()
+    ax2.text(width + 0.02, bar.get_y() + bar.get_height()/2, f'{width:.3f}',
+            ha='left', va='center', fontsize=9)
+
+plt.tight_layout()
+plt.savefig('station_performance_comparison.png', dpi=300, bbox_inches='tight')
+print("✓ Saved: station_performance_comparison.png")
+
+# Figure 4: Residuals Analysis
+fig4, axes = plt.subplots(1, 2, figsize=(16, 6))
+fig4.suptitle(f'Residual Analysis - {best_model_name}', fontsize=16, fontweight='bold')
+
+# Calculate residuals
+residuals = y_test - best_predictions
+
+# Residual Distribution
+ax1 = axes[0]
+ax1.hist(residuals, bins=100, color='#3498db', alpha=0.7, edgecolor='black')
+ax1.axvline(x=0, color='red', linestyle='--', linewidth=2, label='Zero Error')
+ax1.set_xlabel('Residuals', fontsize=11, fontweight='bold')
+ax1.set_ylabel('Frequency', fontsize=11, fontweight='bold')
+ax1.set_title('Residual Distribution', fontweight='bold', fontsize=12)
+ax1.legend(fontsize=10)
+ax1.grid(True, alpha=0.3, axis='y')
+
+# Residual vs Predicted
+ax2 = axes[1]
+sample_size = min(5000, len(residuals))
+indices = np.random.choice(len(residuals), sample_size, replace=False)
+ax2.scatter(best_predictions[indices], residuals.iloc[indices], alpha=0.3, s=10, color='#e74c3c')
+ax2.axhline(y=0, color='blue', linestyle='--', linewidth=2, label='Zero Error Line')
+ax2.set_xlabel('Predicted PM2.5', fontsize=11, fontweight='bold')
+ax2.set_ylabel('Residuals', fontsize=11, fontweight='bold')
+ax2.set_title('Residuals vs Predicted Values', fontweight='bold', fontsize=12)
+ax2.legend(fontsize=10)
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('unified_residuals_analysis.png', dpi=300, bbox_inches='tight')
+print("✓ Saved: unified_residuals_analysis.png")
+
+# Figure 5: Feature Importance (only for tree-based models)
+if best_model_name in ['Random Forest', 'Gradient Boosting', 'XGBoost', 'Decision Tree']:
+    print("\n📊 Generating Feature Importance Plot...")
+    
+    feature_importance = pd.DataFrame({
+        'Feature': feature_cols,
+        'Importance': best_model_obj.feature_importances_
+    }).sort_values('Importance', ascending=False).head(20)
+    
+    fig5, ax = plt.subplots(figsize=(12, 10))
+    colors = plt.cm.RdYlGn(np.linspace(0.3, 0.9, len(feature_importance)))
+    bars = ax.barh(feature_importance['Feature'], feature_importance['Importance'], 
+                   color=colors, alpha=0.8)
+    ax.set_xlabel('Importance Score', fontsize=12, fontweight='bold')
+    ax.set_title(f'Top 20 Feature Importance - {best_model_name}', 
+                fontweight='bold', fontsize=14)
+    ax.invert_yaxis()
+    ax.grid(True, alpha=0.3, axis='x')
+    
+    for bar in bars:
+        width = bar.get_width()
+        ax.text(width, bar.get_y() + bar.get_height()/2, f'{width:.4f}',
+                ha='left', va='center', fontsize=9)
+    
+    plt.tight_layout()
+    plt.savefig('feature_importance.png', dpi=300, bbox_inches='tight')
+    print("✓ Saved: feature_importance.png")
+
+# Figure 6: Model Comparison Summary Heatmap
+print("\n📊 Generating Model Comparison Heatmap...")
+
+fig6, ax = plt.subplots(figsize=(12, 8))
+
+# Prepare data for heatmap (normalize metrics to 0-1 scale)
+heatmap_data = results_df[['Algorithm', 'Train_RMSE', 'Test_RMSE', 'Train_R2', 
+                            'Test_R2', 'CV_RMSE', 'Train_MAE', 'Test_MAE']].copy()
+heatmap_data = heatmap_data.set_index('Algorithm')
+
+# Normalize (inverse for error metrics, direct for R2)
+for col in ['Train_RMSE', 'Test_RMSE', 'CV_RMSE', 'Train_MAE', 'Test_MAE']:
+    heatmap_data[col] = 1 - (heatmap_data[col] - heatmap_data[col].min()) / (heatmap_data[col].max() - heatmap_data[col].min())
+
+for col in ['Train_R2', 'Test_R2']:
+    heatmap_data[col] = (heatmap_data[col] - heatmap_data[col].min()) / (heatmap_data[col].max() - heatmap_data[col].min())
+
+# Create heatmap
+sns.heatmap(heatmap_data, annot=True, fmt='.3f', cmap='RdYlGn', 
+            cbar_kws={'label': 'Normalized Performance (0=Worst, 1=Best)'},
+            linewidths=0.5, ax=ax)
+ax.set_title('Model Performance Heatmap (Normalized Scores)', 
+             fontweight='bold', fontsize=14, pad=20)
+ax.set_xlabel('Metrics', fontsize=12, fontweight='bold')
+ax.set_ylabel('Algorithms', fontsize=12, fontweight='bold')
+
+plt.tight_layout()
+plt.savefig('model_comparison_heatmap.png', dpi=300, bbox_inches='tight')
+print("✓ Saved: model_comparison_heatmap.png")
+
+# Figure 7: Error Distribution by Station
+print("\n📊 Generating Station Error Distribution...")
+
+fig7, ax = plt.subplots(figsize=(14, 8))
+
+station_residuals = []
+station_labels = []
+
+for station in combined_df['station'].unique():
+    station_mask = test_stations == station
+    if station_mask.sum() > 0:
+        station_resid = y_test[station_mask] - best_predictions[station_mask]
+        station_residuals.append(station_resid)
+        station_labels.append(station)
+
+bp = ax.boxplot(station_residuals, labels=station_labels, patch_artist=True,
+                showmeans=True, meanline=True)
+
+# Color the boxes
+colors = plt.cm.viridis(np.linspace(0.3, 0.9, len(station_labels)))
+for patch, color in zip(bp['boxes'], colors):
+    patch.set_facecolor(color)
+    patch.set_alpha(0.7)
+
+ax.axhline(y=0, color='red', linestyle='--', linewidth=2, label='Zero Error')
+ax.set_xlabel('Station', fontsize=12, fontweight='bold')
+ax.set_ylabel('Residuals (Actual - Predicted)', fontsize=12, fontweight='bold')
+ax.set_title(f'Error Distribution by Station - {best_model_name}', 
+             
+             fontweight='bold', fontsize=14)
+ax.legend(fontsize=10)
+ax.grid(True, alpha=0.3, axis='y')
+plt.xticks(rotation=45, ha='right')
+
+plt.tight_layout()
+plt.savefig('station_error_distribution.png', dpi=300, bbox_inches='tight')
+print("✓ Saved: station_error_distribution.png")
+
+# ==================== SUMMARY ====================
+print("\n" + "=" * 80)
+print("VISUALIZATION COMPLETE")
+print("=" * 80)
+print("\n📁 Generated Files:")
+print("   1. unified_model_comparison.png - Overall model performance comparison")
+print("   2. unified_predictions_vs_actual.png - Prediction accuracy scatter plot")
+print("   3. station_performance_comparison.png - Per-station RMSE and R² scores")
+print("   4. unified_residuals_analysis.png - Residual distribution and patterns")
+if best_model_name in ['Random Forest', 'Gradient Boosting', 'XGBoost', 'Decision Tree']:
+    print("   5. feature_importance.png - Top 20 most important features")
+print(f"   {5 if best_model_name in ['Random Forest', 'Gradient Boosting', 'XGBoost', 'Decision Tree'] else 5}. model_comparison_heatmap.png - Normalized performance heatmap")
+print(f"   {6 if best_model_name in ['Random Forest', 'Gradient Boosting', 'XGBoost', 'Decision Tree'] else 6}. station_error_distribution.png - Error boxplots by station")
+
+print("\n✅ Analysis Complete!")
+print("=" * 80)
